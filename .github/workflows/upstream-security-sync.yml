@@ -1,0 +1,100 @@
+name: Upstream security sync check
+
+# Tasmanian-Cloud/ledger is a fork of formancehq/ledger. This workflow has no
+# other job: surface when upstream has commits we don't, and flag if any of
+# them look security-related, so the fork doesn't silently drift away from
+# upstream security fixes. It never merges anything automatically — it only
+# opens (or reuses) a tracking issue for a human to act on.
+
+on:
+  schedule:
+    - cron: '17 6 * * *'  # daily, 06:17 UTC — offset from the hour to avoid GH Actions' top-of-hour scheduling pile-up
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Add upstream remote and fetch
+        run: |
+          git remote add upstream https://github.com/formancehq/ledger.git
+          git fetch upstream main
+
+      - name: Diff against upstream/main
+        id: diff
+        run: |
+          set -e
+          new_commits="$(git log --format='%H %s' main..upstream/main)"
+          count="$(printf '%s\n' "$new_commits" | grep -c . || true)"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+
+          if [ "$count" -eq 0 ]; then
+            echo "No new upstream commits — nothing to do."
+            exit 0
+          fi
+
+          # Flag anything that looks security-related, checking the full
+          # commit message (subject + body), not just the subject line.
+          security_hashes=""
+          while read -r hash subject; do
+            [ -z "$hash" ] && continue
+            body="$(git log -1 --format='%B' "$hash")"
+            if printf '%s' "$body" | grep -qiE 'security|CVE-[0-9]|vulnerab'; then
+              security_hashes="$security_hashes $hash"
+            fi
+          done <<< "$new_commits"
+
+          {
+            echo 'body<<EOF'
+            echo "formancehq/ledger's \`main\` has $count commit(s) not yet in this fork's \`main\`."
+            echo
+            if [ -n "$security_hashes" ]; then
+              echo "**Possible security-related commits (matched \"security\"/\"CVE-\"/\"vulnerab\" in the commit message):**"
+              for h in $security_hashes; do
+                echo "- [$h](https://github.com/formancehq/ledger/commit/$h) — $(git log -1 --format='%s' "$h")"
+              done
+              echo
+            fi
+            echo "**All new upstream commits:**"
+            echo '```'
+            printf '%s\n' "$new_commits"
+            echo '```'
+            echo
+            echo "This issue is opened/updated automatically by \`.github/workflows/upstream-security-sync.yml\`. It does not auto-merge anything — review and merge \`upstream/main\` manually when ready, then close this issue (it will reopen next run if commits still differ)."
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Ensure the upstream-sync label exists
+        if: steps.diff.outputs.count != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh label create upstream-sync --color BFD4F2 \
+            --description "New commits on formancehq/ledger not yet in this fork" \
+            2>/dev/null || true  # already exists — fine, gh has no idempotent "create if missing"
+
+      - name: Open or update tracking issue
+        if: steps.diff.outputs.count != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BODY: ${{ steps.diff.outputs.body }}
+        run: |
+          set -e
+          existing="$(gh issue list --label upstream-sync --state open --json number --jq '.[0].number' || true)"
+          if [ -n "$existing" ] && [ "$existing" != "null" ]; then
+            gh issue comment "$existing" --body "$BODY"
+          else
+            gh issue create \
+              --title "Upstream sync: formancehq/ledger has commits not in this fork" \
+              --label upstream-sync \
+              --body "$BODY"
+          fi
