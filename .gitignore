@@ -11,3 +11,10 @@ dumps
 .envrc.*
 Pulumi.*.yaml
 coverage.txt
+# Agent scratch - never commit
+.harness/
+.box/
+.cache/
+__pycache__/
+*.pyc
+*.log
